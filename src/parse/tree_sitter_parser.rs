@@ -18,8 +18,9 @@ use crate::parse::syntax::{AtomKind, Syntax};
 ///
 /// Note that we don't support sub-languages more than one layer deep.
 pub(crate) struct TreeSitterSubLanguage {
-    /// How to identify a node. The query must contain exactly one
-    /// capture group (the name is arbitrary).
+    /// How to identify a node. The first capture group (index 0) is
+    /// the node to parse. Additional captures may be used for
+    /// predicates such as `#eq?`.
     query: ts::Query,
 
     /// What language parser to use (refers in turn to a TreeSitterConfig).
@@ -985,7 +986,7 @@ pub(crate) fn from_language(language: guess::Language) -> TreeSitterConfig {
             let language = tree_sitter::Language::new(language_fn);
             TreeSitterConfig {
                 language: language.clone(),
-                atom_nodes: ["string", "heredoc_body", "regex"].into_iter().collect(),
+                atom_nodes: ["string", "regex"].into_iter().collect(),
                 delimiter_tokens: vec![
                     ("{", "}"),
                     ("(", ")"),
@@ -998,7 +999,14 @@ pub(crate) fn from_language(language: guess::Language) -> TreeSitterConfig {
                 ignore_trailing_tokens: vec![],
                 highlight_query: ts::Query::new(&language, tree_sitter_ruby::HIGHLIGHTS_QUERY)
                     .unwrap(),
-                sub_languages: vec![],
+                sub_languages: vec![TreeSitterSubLanguage {
+                    query: ts::Query::new(
+                        &language,
+                        r#"(heredoc_body (heredoc_content) @contents (heredoc_end) @_end (#eq? @_end "SQL"))"#,
+                    )
+                    .unwrap(),
+                    parse_as: Sql,
+                }],
             }
         }
         Rust => {
@@ -2025,6 +2033,53 @@ mod tests {
                 panic!("Top level isn't a list");
             }
         };
+    }
+
+    /// Test that Ruby <<~SQL heredocs are parsed as SQL.
+    #[test]
+    fn test_ruby_sql_heredoc_subtree() {
+        let arena = Arena::new();
+        let config = from_language(guess::Language::Ruby);
+        let src = "query = <<~SQL\n  SELECT * FROM users\nSQL\n";
+        let res = parse(&arena, src, &config, false);
+
+        // Find the heredoc_body node in the parsed result. It should
+        // be a List (parsed as SQL), not an Atom.
+        let has_list = res.iter().any(|node| matches!(node, Syntax::List { .. }));
+        assert!(has_list, "SQL heredoc content should be parsed as a list");
+    }
+
+    /// Test that non-SQL heredocs are NOT parsed as SQL.
+    #[test]
+    fn test_ruby_non_sql_heredoc_not_injected() {
+        let arena = Arena::new();
+        let config = from_language(guess::Language::Ruby);
+
+        // Parse the same content with both SQL and SH tags. The SQL
+        // version should produce more syntax nodes (structurally
+        // parsed), while the SH version should have fewer (not
+        // injected).
+        let sql_src = "q = <<~SQL\n  SELECT * FROM users\nSQL\n";
+        let sh_src = "q = <<~SH\n  SELECT * FROM users\nSH\n";
+
+        let sql_res = parse(&arena, sql_src, &config, false);
+        let arena2 = Arena::new();
+        let sh_res = parse(&arena2, sh_src, &config, false);
+
+        fn count_nodes(nodes: &[&Syntax]) -> usize {
+            nodes
+                .iter()
+                .map(|n| match n {
+                    Syntax::Atom { .. } => 1,
+                    Syntax::List { children, .. } => 1 + count_nodes(children),
+                })
+                .sum()
+        }
+
+        assert!(
+            count_nodes(&sql_res) > count_nodes(&sh_res),
+            "SQL heredoc should produce more nodes than SH heredoc with same content"
+        );
     }
 
     /// Ensure that we don't crash when loading any of the
